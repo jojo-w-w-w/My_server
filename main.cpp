@@ -17,6 +17,8 @@
 #include <poll.h>
 #include <unistd.h>  // STDIN_FILENO
 
+#include <filesystem>
+
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <unistd.h>
@@ -188,7 +190,7 @@ void handleClient(int clientFd)
                 std::string errorResponse = buildResponse(
                     "431 Request Header Fields Too Large",
                     "Request Header Fields Too Large\n",
-                    "text/plain; charsetr=utf-8",
+                    "text/plain; charset=utf-8",
                     true
                 );
                 sendAll(clientFd, errorResponse);
@@ -227,11 +229,20 @@ void handleClient(int clientFd)
         std::string method;
         std::string path;
         std::string version;
+        std::string queryString;//保存参数
 
         bool requestLineValid = parseRequestLine(request, method, path, version);
 
         if(requestLineValid)
         {
+            auto question_mark = path.find('?');
+            if(question_mark != std::string::npos)
+            {
+                queryString = path.substr(question_mark + 1);
+
+                path.erase(question_mark);
+            }
+
             std::cout << "提取方法为: " << method << std::endl;
             std::cout << "请求路径为: " << path << std::endl;
             std::cout << "版本为: " << version << std::endl;
@@ -263,18 +274,26 @@ void handleClient(int clientFd)
         }
         else
         {  
-            if(path == "/" || path == "/index.html")
+            if(path == "/hello")
+            {
+                status = "200 OK";
+
+                if(queryString.find("name=") == 0)
+                {
+                    body = "Hello, " + queryString.substr(5) + "\n";
+                }
+                else
+                {
+                    body = "Hello\n";
+                }
+            }
+            else if(path == "/")
             {
                 filePath = "www/index.html";
             }
-            else if(path == "/about.html")
+            else if(!path.empty() && path[0] == '/' && path.find("..") == std::string::npos)
             {
-                filePath = "www/about.html";
-            }
-            else if(path == "/hello")
-            {
-                status = "200 OK";
-                body = "Hello\n";
+                filePath = "www" + path;
             }
             else
             {
@@ -284,16 +303,56 @@ void handleClient(int clientFd)
 
             if(!filePath.empty())
             {
-                if(readFile(filePath, body))
-                {//如果文件正常打开
-                    status = "200 OK";
-                    contentType = "text/html; charset=utf-8";
+                if(!std::filesystem::is_regular_file(filePath))
+                {//文件不存在，或路径指向的不是普通的文件
+                    status = "404 Not Found";
+                    body = "Not Found\n";
                 }
-                else
+                else//文件存在
                 {
-                    status = "500 Internal Server Error";
-                    body = "Internal Server Error\n";
+                    // 得到 www 的真实路径
+                    auto www_real_path = std::filesystem::canonical("www");
+
+                    // 得到目标文件的真实路径。它会把符号链接解析成最终指向的位置。
+                    auto dir_file_real_path = std::filesystem::canonical(filePath);
+
+                    // 求相对路径
+                    auto file_relative_path = dir_file_real_path.lexically_relative(www_real_path);
+
+                    // 标记路径是否为空或者指向 www 外部的文件
+                    bool outside = file_relative_path.empty() || *file_relative_path.begin() == "..";
+
+                    if(outside)
+                    {
+                        status = "404 Not Found";
+                        body = "Not Found\n";
+                    }
+                    else if(readFile(dir_file_real_path.string(), body))
+                    {// 如果文件正常打开
+                        status = "200 OK";
+                        std::string extension = std::filesystem::path(filePath).extension().string();
+                        contentType = "application/octet-stream";
+                        
+                        if(extension == ".html")
+                        {
+                            contentType = "text/html; charset=utf-8";
+                        }
+                        else if(extension == ".css")
+                        {
+                            contentType = "text/css; charset=utf-8";
+                        }
+                        else if(extension == ".png")
+                        {
+                            contentType = "image/png";
+                        }
+                    }
+                    else
+                    {// 读取失败
+                        status = "500 Internal Server Error";
+                        body = "Internal Server Error\n";
+                    }
                 }
+                
             } 
         }
         
@@ -466,7 +525,7 @@ int main()
                 std::string queuedResponse = buildResponse(
                     "503 Service Unavailable",
                     "Service Unavailable\n",
-                    "text/plain; charsetr=utf-8",
+                    "text/plain; charset=utf-8",
                     true
                 );
                 sendAll(clientFd, queuedResponse);
