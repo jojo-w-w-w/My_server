@@ -18,6 +18,7 @@
 #include <unistd.h>  // STDIN_FILENO
 
 #include <filesystem>
+#include <utility>
 
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -94,16 +95,40 @@ std::string buildResponse(const std::string& status, const std::string& body, co
     return response;
 }
 
-bool readFile(const std::string& filePath, std::string& content)
+bool readFile(const std::string& filePath, std::string& content, std::size_t maxBytes)
 {
     //指令，路径正确打开文件
     std::ifstream file(filePath, std::ios::binary);
     if(file.is_open())
     {
         //如果文件正常打开
-        std::ostringstream contents;
-        contents << file.rdbuf();
-        content = contents.str();
+        std::string tempContent;
+        char chunk[4096];
+
+        while(file)
+        {
+            file.read(chunk, sizeof(chunk));
+            std::streamsize count = file.gcount();
+
+            if(count > 0)
+            {
+                std::size_t bytes = static_cast<std::size_t>(count);
+
+                if(tempContent.size() + bytes > maxBytes)
+                {
+                    return false;
+                }
+                tempContent.append(chunk, bytes);
+            }
+        }
+
+        if(file.bad())
+        {
+            return false;
+        }
+     
+        content = std::move(tempContent);
+        
         return true;
     }
     return false;
@@ -303,56 +328,93 @@ void handleClient(int clientFd)
 
             if(!filePath.empty())
             {
-                if(!std::filesystem::is_regular_file(filePath))
-                {//文件不存在，或路径指向的不是普通的文件
+                std::error_code fileStatusError;
+                bool isRegularFile = std::filesystem::is_regular_file(filePath, fileStatusError);
+
+                if(fileStatusError && fileStatusError != std::errc::no_such_file_or_directory)
+                {//文件不存在
+                    status = "500 Internal Server Error";
+                    body = "Internal Server Error\n";
+                }
+                else if(!isRegularFile)
+                {// 不是普通文件
                     status = "404 Not Found";
                     body = "Not Found\n";
                 }
                 else//文件存在
                 {
+                    std::error_code wwwError;
+                    std::error_code fileError;
+                
                     // 得到 www 的真实路径
-                    auto www_real_path = std::filesystem::canonical("www");
+                    auto www_real_path = std::filesystem::canonical("www", wwwError);
 
                     // 得到目标文件的真实路径。它会把符号链接解析成最终指向的位置。
-                    auto dir_file_real_path = std::filesystem::canonical(filePath);
+                    auto dir_file_real_path = std::filesystem::canonical(filePath, fileError);
 
-                    // 求相对路径
-                    auto file_relative_path = dir_file_real_path.lexically_relative(www_real_path);
-
-                    // 标记路径是否为空或者指向 www 外部的文件
-                    bool outside = file_relative_path.empty() || *file_relative_path.begin() == "..";
-
-                    if(outside)
+                    if(wwwError || fileError)
                     {
-                        status = "404 Not Found";
-                        body = "Not Found\n";
-                    }
-                    else if(readFile(dir_file_real_path.string(), body))
-                    {// 如果文件正常打开
-                        status = "200 OK";
-                        std::string extension = std::filesystem::path(filePath).extension().string();
-                        contentType = "application/octet-stream";
-                        
-                        if(extension == ".html")
-                        {
-                            contentType = "text/html; charset=utf-8";
-                        }
-                        else if(extension == ".css")
-                        {
-                            contentType = "text/css; charset=utf-8";
-                        }
-                        else if(extension == ".png")
-                        {
-                            contentType = "image/png";
-                        }
-                    }
-                    else
-                    {// 读取失败
                         status = "500 Internal Server Error";
                         body = "Internal Server Error\n";
                     }
+                    else
+                    {
+                        // 求相对路径
+                        auto file_relative_path = dir_file_real_path.lexically_relative(www_real_path);
+
+                        // 标记路径是否为空或者指向 www 外部的文件
+                        bool outside = file_relative_path.empty() || *file_relative_path.begin() == "..";
+
+                        if(outside)
+                        {
+                            status = "404 Not Found";
+                            body = "Not Found\n";
+                        }
+                        else
+                        {
+                            constexpr auto maxFileBytes = 5ULL * 1024 * 1024;
+
+                            std::error_code sizeError;
+                            auto fileBytes = std::filesystem::file_size(dir_file_real_path, sizeError);
+
+                            if(sizeError)
+                            {
+                                status = "500 Check Size Error";
+                                body = "Check Size Error\n";
+                            }
+                            else if(fileBytes > maxFileBytes)
+                            {
+                                status = "403 Forbidden";
+                                body = "File Too Large\n";
+                            }
+                            else if(readFile(dir_file_real_path.string(), body, maxFileBytes))
+                            {// 如果文件正常打开
+                                status = "200 OK";
+                                std::string extension = std::filesystem::path(filePath).extension().string();
+                                contentType = "application/octet-stream";
+                                
+                                if(extension == ".html")
+                                {
+                                    contentType = "text/html; charset=utf-8";
+                                }
+                                else if(extension == ".css")
+                                {
+                                    contentType = "text/css; charset=utf-8";
+                                }
+                                else if(extension == ".png")
+                                {
+                                    contentType = "image/png";
+                                }
+                            }
+                            else
+                            {// 读取失败
+                                status = "500 Internal Server Error";
+                                body = "Internal Server Error\n";
+                            }
+                        }
+                        
+                    }
                 }
-                
             } 
         }
         
