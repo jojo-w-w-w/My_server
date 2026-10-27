@@ -177,6 +177,7 @@ void handleClient(int clientFd)
     // 准备一块内存，用来存放接收到的数据
     char buffer[4096]{};
 
+    // 预防客户端发送请求超时
     timeval timeout{};
     timeout.tv_sec = 3;   // 秒
     timeout.tv_usec = 0;  // 微秒
@@ -208,8 +209,15 @@ void handleClient(int clientFd)
         {
             std::cout << "本次 recv 收到" << received << " 字节" << std::endl;
 
+            request.append(buffer, received);
+
+            auto findRequestHeadTail = request.find("\r\n\r\n");
+
+            std::size_t headerLength = findRequestHeadTail == 
+                std::string::npos ? request.size() : findRequestHeadTail + 4;
+
             // 请求头长度检测
-            if (request.size() + static_cast<size_t>(received) > 8192)
+            if (headerLength > 8192)
             {
                 std::cerr << "客户端请求头长度超过限制\n";
                 std::string errorResponse = buildResponse(
@@ -222,8 +230,7 @@ void handleClient(int clientFd)
                 break;
             }
 
-            request.append(buffer, received);
-            if(request.find("\r\n\r\n") != std::string::npos)
+            if(findRequestHeadTail != std::string::npos)
             {
                 headersComplete = true;
             }
@@ -549,6 +556,13 @@ int main()
             }
         }
 
+        // poll的退出边界
+        if(watched[1].revents & POLLHUP || watched[1].revents & POLLERR || watched[1].revents & POLLNVAL)
+        {
+            std::cout << "已退出" << std::endl;
+            break;
+        }
+
         // 有新连接时，才执行 accept
         if (watched[0].revents & POLLIN)
         {
@@ -559,6 +573,27 @@ int main()
                 perror("accept");
                 acceptFailed = true;
                 break;
+            }
+
+            // 预防大文件不读取阻塞服务器
+            timeval timeout{};
+            timeout.tv_sec = 3;   // 秒
+            timeout.tv_usec = 0;  // 微秒
+            
+            int result = setsockopt
+            (
+                clientFd,
+                SOL_SOCKET,
+                SO_SNDTIMEO,
+                &timeout,
+                sizeof(timeout)
+            );
+
+            if(result == -1)
+            {
+                perror("setsockopt");
+                close(clientFd);
+                continue;
             }
 
             //普通函数调用，主线程必须等它执行完，才能继续下一次 accept。
